@@ -57,8 +57,9 @@ python sem_pipeline.py data/SEM_results.tif --points "400,190;900,190" --design-
 - Two parametric models ship in `sem_pipeline.py`, selected via the `shape_fn` argument to
   `fit_waveguide_to_contours` / `optimize_shape_params`:
   - `generate_waveguide_shape` — straight waveguide + one-sided taper (`[W1..L2, length_waveguide]`).
-  - `generate_diamond_device` — symmetric diamond taper + guide (`[w_tip, w_max, w_guide, L_up, L_down, L_guide]`),
-    for devices that widen to a peak then narrow. Use `estimate_diamond_nominal(contour)` to auto-seed
+  - `generate_diamond_device` — symmetric diamond taper + guide with a step edge
+    (`[w_tip, w_max, w_neck, w_guide, L_up, L_down, L_guide]`): widens tip→peak, narrows to a neck,
+    then a vertical step drops to the guide width. Use `estimate_diamond_nominal(contour)` to auto-seed
     params from the contour and `diamond_bounds(nominal)` for the search box.
   Add your own generator (any `params -> (N,2) closed ring`) and pass it as `shape_fn` to fit other shapes.
 - The full outer optimization runs a placement search per candidate, so it takes minutes; the

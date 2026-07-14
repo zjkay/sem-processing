@@ -459,42 +459,53 @@ def generate_waveguide_shape(params) -> np.ndarray:
 # template structurally cannot represent that middle bulge, so fitting it to a
 # diamond collapses to a thin rod and reports a huge Hausdorff distance.
 #
-# This model captures that topology with 6 parameters:
+# This model captures that topology with 7 parameters:
 #     w_tip   : width at the narrow left tip
 #     w_max   : maximum width (the diamond's widest point)
-#     w_guide : width of the straight guide the diamond narrows into
+#     w_neck  : width at the END of the down-taper, before the step
+#     w_guide : width of the straight guide after the step
 #     L_up    : length over which it widens (tip -> max)
-#     L_down  : length over which it narrows (max -> guide width)
+#     L_down  : length over which it narrows (max -> neck)
 #     L_guide : length of the constant-width guide section
 #
+# The taper narrows to w_neck and then a VERTICAL STEP EDGE drops it to the
+# (narrower) guide width w_guide -- that step is the "extra edge" that sticks
+# out past the guide. When w_neck == w_guide the step vanishes and this reduces
+# to a plain diamond + guide.
+#
 #         w_max/2 __
-#               /    \____
-#   w_tip/2 __/           \________  w_guide/2
-#           |  Lup | Ldown |  Lguide |
-#           0     xpk     xneck     xend      (symmetric about y = 0)
+#               /    \__            w_neck/2
+#   w_tip/2 __/        \|__________ w_guide/2   <- vertical step at xneck
+#           |  Lup | Ldown | Lguide |
+#           0     xpk     xneck     xend        (symmetric about y = 0)
 # -----------------------------------------------------------------------------
 
-DIAMOND_PARAM_NAMES = ['w_tip', 'w_max', 'w_guide', 'L_up', 'L_down', 'L_guide']
+DIAMOND_PARAM_NAMES = ['w_tip', 'w_max', 'w_neck', 'w_guide', 'L_up', 'L_down', 'L_guide']
 
 
 def generate_diamond_device(params) -> np.ndarray:
     """
     Build a symmetric diamond-taper + guide outline (closed (N,2) polygon) from
-    [w_tip, w_max, w_guide, L_up, L_down, L_guide]. Symmetric about y=0; the
-    tip sits at x=0 and x grows to the right. Placement (dx,dy,theta) is applied
-    later by transform_shape, exactly like the waveguide model.
+    [w_tip, w_max, w_neck, w_guide, L_up, L_down, L_guide]. Symmetric about y=0;
+    the tip sits at x=0 and x grows to the right. Placement (dx,dy,theta) is
+    applied later by transform_shape, exactly like the waveguide model.
+
+    The taper ends at w_neck, then a vertical step at the same x drops it to
+    w_guide before the straight guide runs on -- this is the step edge.
     """
-    w_tip, w_max, w_guide, L_up, L_down, L_guide = params
-    # x positions of the four control stations along the axis.
+    w_tip, w_max, w_neck, w_guide, L_up, L_down, L_guide = params
     x0 = 0.0
     x1 = x0 + L_up            # widest point
-    x2 = x1 + L_down          # where it reaches guide width
+    x2 = x1 + L_down          # taper end (neck), before the step
     x3 = x2 + L_guide         # end of the guide
-    widths = [w_tip, w_max, w_guide, w_guide]
-    xs = [x0, x1, x2, x3]
-    top = [(x,  w / 2) for x, w in zip(xs, widths)]     # left->right along top
-    bot = [(x, -w / 2) for x, w in zip(xs, widths)]     # its mirror
-    ring = top + bot[::-1] + [top[0]]                   # close the loop
+    # Top edge, left -> right. Two points share x2: the neck, then the step down
+    # to the guide -- that repeated x is the vertical step edge.
+    top = [(x0, w_tip / 2),
+           (x1, w_max / 2),
+           (x2, w_neck / 2),
+           (x2, w_guide / 2),
+           (x3, w_guide / 2)]
+    ring = top + [(x, -y) for (x, y) in reversed(top)] + [top[0]]   # mirror + close
     return np.array(ring)
 
 
@@ -523,25 +534,40 @@ def estimate_diamond_nominal(contour_pts):
 
     ipk = int(np.nanargmax(widths))
     x_pk, w_max = qx[ipk], widths[ipk]
-    w_tip = np.nanmedian(widths[qx < xmin + 0.12 * L])       # near the tip
-    w_guide = np.nanmedian(widths[qx > xmin + 0.85 * L])     # near the far end
+    # Tip is the narrowest point near the left end (width grows fast rightward,
+    # so a median over that window over-estimates it) -> use the min.
+    w_tip = np.nanmin(widths[qx < xmin + 0.12 * L])
+
+    # Locate the taper->guide STEP: the sharpest width drop to the right of the
+    # peak. w_neck is the width just before it; w_guide is the width after it.
+    dqw = np.diff(widths)
+    post = np.where(qx[1:] > x_pk)[0]                         # diffs past the peak
+    if len(post):
+        step_i = int(post[np.nanargmin(dqw[post])])          # most negative drop
+        x_step = qx[step_i]
+        w_neck = widths[step_i]
+        after = widths[qx > x_step + 0.02 * L]
+        w_guide = np.nanmedian(after) if np.isfinite(after).any() else w_neck
+    else:                                                    # no clear step
+        x_step = xmin + 0.85 * L
+        w_neck = w_guide = np.nanmedian(widths[qx > x_step])
+
     L_up = x_pk - xmin
-    rest = xmax - x_pk
-    L_down = 0.75 * rest                                     # narrowing section
-    L_guide = 0.25 * rest                                    # straight guide
-    return [float(w_tip), float(w_max), float(w_guide),
+    L_down = max(1.0, x_step - x_pk)
+    L_guide = max(1.0, xmax - x_step)
+    return [float(w_tip), float(w_max), float(w_neck), float(w_guide),
             float(L_up), float(L_down), float(L_guide)]
 
 
 def diamond_bounds(nominal, width_frac=0.35, length_frac=0.30):
     """
     Box bounds for optimize_shape_params around estimated diamond params:
-    widths +/- width_frac, lengths +/- length_frac. (Widths are the first 3
-    entries, lengths the last 3.)
+    widths +/- width_frac, lengths +/- length_frac. (Widths are the first 4
+    entries -- w_tip, w_max, w_neck, w_guide; lengths are the last 3.)
     """
     lo_hi = []
     for i, p in enumerate(nominal):
-        frac = width_frac if i < 3 else length_frac
+        frac = width_frac if i < 4 else length_frac
         lo_hi.append((max(1.0, (1 - frac) * p), (1 + frac) * p))
     return lo_hi
 
