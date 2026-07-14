@@ -493,10 +493,13 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
          the contour's centroid (a good dx,dy starting guess).
       2. Coarse ROTATION sweep at 0/90/180/270 deg. At each angle, run a small
          differential evolution over (dx,dy) (relative to the centroid guess)
-         minimizing the union area. Keep the best (angle,dx,dy).  <-- this is
-         the "optimize angle for overlap" part of the request.
-      3. Final 3-D differential evolution over (dx,dy,theta) in a narrow box
-         around that best, to polish the placement.
+         minimizing the union area. KEEP all four sector results (not just the
+         single best).  <-- the "optimize angle for overlap" part.
+      3. Fine-tune EVERY sector with a 3-D differential evolution over
+         (dx,dy,theta), letting theta roam +/-45 deg around that sector center.
+         The four +/-45 deg windows tile the whole 360 deg circle, so every
+         orientation is covered while each search stays local. Take the best
+         result over all four sectors.
 
     Returns
     -------
@@ -522,8 +525,10 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
                          for i in range(len(shape_pts) - 1))
     max_distance = max(max_edge_contour, max_edge_shape)
 
-    # 2) Coarse angle sweep with a (dx,dy) DE at each angle.
-    best = {"angle_deg": None, "dx": None, "dy": None, "combined_area": np.inf}
+    # 2) Coarse angle sweep: at each of 0/90/180/270 deg run a (dx,dy) DE and
+    #    KEEP every sector's result (not just the single best). Each sector is
+    #    the center of a 90-deg-wide slice of the circle.
+    sectors = []
     for angle_deg in range(0, 360, 90):
         theta_rad = np.deg2rad(angle_deg)
 
@@ -534,31 +539,35 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
         bounds = [(-max_distance, max_distance), (-max_distance, max_distance)]
         res = differential_evolution(obj_dxdy, bounds, strategy='best1bin',
                                      popsize=10, maxiter=50, tol=1e-3, polish=True, disp=False)
+        sectors.append({"theta": theta_rad,
+                        "dx": dx_baseline + res.x[0],
+                        "dy": dy_baseline + res.x[1],
+                        "combined_area": res.fun})
+
+    # 3) Fine-tune EVERY sector locally with a 3-D DE over (dx,dy,theta), with
+    #    theta free within +/-45 deg of that sector center. The four +/-45 deg
+    #    windows tile the full 360 deg, so no orientation is missed -- but each
+    #    refinement stays a narrow, well-conditioned local search. Keep the best
+    #    result across all four sectors.
+    best = {"dx": None, "dy": None, "theta": None, "combined_area": np.inf}
+    for s in sectors:
+        def obj_dxdytheta(v, s=s):   # bind s so the closure uses this sector
+            return _combined_area(contour_pts, init_shape_params,
+                                  s["dx"] + v[0], s["dy"] + v[1], s["theta"] + v[2])
+
+        res = differential_evolution(
+            obj_dxdytheta,
+            bounds=[(-0.2 * max_distance, 0.2 * max_distance),
+                    (-0.2 * max_distance, 0.2 * max_distance),
+                    (-np.deg2rad(45), np.deg2rad(45))],
+            strategy='best1bin', popsize=10, maxiter=50, tol=1e-3, polish=True, disp=False)
         if res.fun < best["combined_area"]:
-            best.update(angle_deg=angle_deg,
-                        dx=dx_baseline + res.x[0],
-                        dy=dy_baseline + res.x[1],
+            best.update(dx=s["dx"] + res.x[0],
+                        dy=s["dy"] + res.x[1],
+                        theta=s["theta"] + res.x[2],
                         combined_area=res.fun)
 
-    dx_best, dy_best = best["dx"], best["dy"]
-    theta_best = np.deg2rad(best["angle_deg"])
-
-    # 3) Final 3-D polish over (dx,dy,theta), searching *deltas* around best.
-    def obj_dxdytheta(v):
-        return _combined_area(contour_pts, init_shape_params,
-                              dx_best + v[0], dy_best + v[1], theta_best + v[2])
-
-    res3 = differential_evolution(
-        obj_dxdytheta,
-        bounds=[(-0.2 * max_distance, 0.2 * max_distance),
-                (-0.2 * max_distance, 0.2 * max_distance),
-                (-np.deg2rad(90), np.deg2rad(90))],
-        strategy='best1bin', popsize=10, maxiter=50, tol=1e-3, polish=True, disp=False)
-
-    dx_f = dx_best + res3.x[0]
-    dy_f = dy_best + res3.x[1]
-    theta_f = theta_best + res3.x[2]
-
+    dx_f, dy_f, theta_f = best["dx"], best["dy"], best["theta"]
     aligned_shape = transform_shape(generate_waveguide_shape(init_shape_params), dx_f, dy_f, theta_f)
 
     # Score = Hausdorff distance (worst-case boundary gap) between the two rings.
