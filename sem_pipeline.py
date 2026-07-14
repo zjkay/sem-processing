@@ -449,6 +449,103 @@ def generate_waveguide_shape(params) -> np.ndarray:
     return np.array(pts)
 
 
+# -----------------------------------------------------------------------------
+# Alternative device model: SYMMETRIC DIAMOND TAPER + GUIDE
+# -----------------------------------------------------------------------------
+# generate_waveguide_shape above is a straight guide + a single one-sided taper.
+# Many real devices (e.g. inverse-taper spot-size converters) instead have a
+# profile that WIDENS from a narrow tip to a maximum, then NARROWS back down to
+# a constant-width guide -- a "diamond" followed by a waveguide. The one-sided
+# template structurally cannot represent that middle bulge, so fitting it to a
+# diamond collapses to a thin rod and reports a huge Hausdorff distance.
+#
+# This model captures that topology with 6 parameters:
+#     w_tip   : width at the narrow left tip
+#     w_max   : maximum width (the diamond's widest point)
+#     w_guide : width of the straight guide the diamond narrows into
+#     L_up    : length over which it widens (tip -> max)
+#     L_down  : length over which it narrows (max -> guide width)
+#     L_guide : length of the constant-width guide section
+#
+#         w_max/2 __
+#               /    \____
+#   w_tip/2 __/           \________  w_guide/2
+#           |  Lup | Ldown |  Lguide |
+#           0     xpk     xneck     xend      (symmetric about y = 0)
+# -----------------------------------------------------------------------------
+
+DIAMOND_PARAM_NAMES = ['w_tip', 'w_max', 'w_guide', 'L_up', 'L_down', 'L_guide']
+
+
+def generate_diamond_device(params) -> np.ndarray:
+    """
+    Build a symmetric diamond-taper + guide outline (closed (N,2) polygon) from
+    [w_tip, w_max, w_guide, L_up, L_down, L_guide]. Symmetric about y=0; the
+    tip sits at x=0 and x grows to the right. Placement (dx,dy,theta) is applied
+    later by transform_shape, exactly like the waveguide model.
+    """
+    w_tip, w_max, w_guide, L_up, L_down, L_guide = params
+    # x positions of the four control stations along the axis.
+    x0 = 0.0
+    x1 = x0 + L_up            # widest point
+    x2 = x1 + L_down          # where it reaches guide width
+    x3 = x2 + L_guide         # end of the guide
+    widths = [w_tip, w_max, w_guide, w_guide]
+    xs = [x0, x1, x2, x3]
+    top = [(x,  w / 2) for x, w in zip(xs, widths)]     # left->right along top
+    bot = [(x, -w / 2) for x, w in zip(xs, widths)]     # its mirror
+    ring = top + bot[::-1] + [top[0]]                   # close the loop
+    return np.array(ring)
+
+
+def estimate_diamond_nominal(contour_pts):
+    """
+    Auto-derive sensible nominal diamond parameters from a measured contour by
+    reading its width profile W(x). Uses a sliding window (not disjoint bins) so
+    thin sections still capture both the top and bottom edge. Returns a 6-vector
+    in DIAMOND_PARAM_NAMES order -- a starting point for optimize_shape_params.
+
+    Assumes the device's long axis is roughly aligned with x (true for these SAM
+    contours). The placement search corrects small rotations afterward.
+    """
+    c = np.asarray(contour_pts)
+    x, y = c[:, 0], c[:, 1]
+    xmin, xmax = x.min(), x.max()
+    L = xmax - xmin
+
+    qx = np.linspace(xmin + 0.02 * L, xmax - 0.02 * L, 40)
+    win = 0.03 * L                                   # window half-width along x
+    widths = np.full(len(qx), np.nan)
+    for i, xq in enumerate(qx):
+        m = np.abs(x - xq) < win
+        if m.sum() >= 2:
+            widths[i] = y[m].max() - y[m].min()
+
+    ipk = int(np.nanargmax(widths))
+    x_pk, w_max = qx[ipk], widths[ipk]
+    w_tip = np.nanmedian(widths[qx < xmin + 0.12 * L])       # near the tip
+    w_guide = np.nanmedian(widths[qx > xmin + 0.85 * L])     # near the far end
+    L_up = x_pk - xmin
+    rest = xmax - x_pk
+    L_down = 0.75 * rest                                     # narrowing section
+    L_guide = 0.25 * rest                                    # straight guide
+    return [float(w_tip), float(w_max), float(w_guide),
+            float(L_up), float(L_down), float(L_guide)]
+
+
+def diamond_bounds(nominal, width_frac=0.35, length_frac=0.30):
+    """
+    Box bounds for optimize_shape_params around estimated diamond params:
+    widths +/- width_frac, lengths +/- length_frac. (Widths are the first 3
+    entries, lengths the last 3.)
+    """
+    lo_hi = []
+    for i, p in enumerate(nominal):
+        frac = width_frac if i < 3 else length_frac
+        lo_hi.append((max(1.0, (1 - frac) * p), (1 + frac) * p))
+    return lo_hi
+
+
 def transform_shape(points: np.ndarray, dx: float, dy: float, dtheta: float) -> np.ndarray:
     """
     Rigidly place a shape: rotate by `dtheta` (radians) about its own centroid,
@@ -463,14 +560,18 @@ def transform_shape(points: np.ndarray, dx: float, dy: float, dtheta: float) -> 
     return rotated + centroid + np.array([dx, dy])
 
 
-def _combined_area(contour_pts, shape_params, dx, dy, theta_rad) -> float:
+def _combined_area(contour_pts, shape_params, dx, dy, theta_rad,
+                   shape_fn=generate_waveguide_shape) -> float:
     """
     Objective helper for the placement search: area of the UNION of the
     contour polygon and the transformed parametric shape. Perfect overlap of
     identical shapes minimizes this; misalignment grows the union. Invalid
     polygons are repaired with buffer(0); failures return a big penalty.
+
+    `shape_fn` builds the parametric outline from `shape_params` (swap in
+    generate_diamond_device to fit a diamond-taper device instead).
     """
-    shape_pts = generate_waveguide_shape(shape_params)
+    shape_pts = shape_fn(shape_params)
     aligned = transform_shape(shape_pts, dx, dy, theta_rad)
     try:
         contour_poly = Polygon(np.asarray(contour_pts))
@@ -484,7 +585,8 @@ def _combined_area(contour_pts, shape_params, dx, dy, theta_rad) -> float:
         return 1e12
 
 
-def fit_waveguide_to_contours(contour_pts, init_shape_params):
+def fit_waveguide_to_contours(contour_pts, init_shape_params,
+                              shape_fn=generate_waveguide_shape):
     """
     STAGE 3b -- INNER placement search for ONE fixed set of shape parameters.
 
@@ -509,7 +611,7 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
         aligned_shape      : (N,2) the placed parametric outline.
     """
     contour_pts = np.asarray(contour_pts)
-    shape_pts = generate_waveguide_shape(init_shape_params)
+    shape_pts = shape_fn(init_shape_params)
 
     # 1) Centroid pre-alignment baseline.
     contour_centroid = Polygon(contour_pts).centroid
@@ -534,7 +636,8 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
 
         def obj_dxdy(dxy):
             return _combined_area(contour_pts, init_shape_params,
-                                  dx_baseline + dxy[0], dy_baseline + dxy[1], theta_rad)
+                                  dx_baseline + dxy[0], dy_baseline + dxy[1], theta_rad,
+                                  shape_fn=shape_fn)
 
         bounds = [(-max_distance, max_distance), (-max_distance, max_distance)]
         res = differential_evolution(obj_dxdy, bounds, strategy='best1bin',
@@ -553,7 +656,8 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
     for s in sectors:
         def obj_dxdytheta(v, s=s):   # bind s so the closure uses this sector
             return _combined_area(contour_pts, init_shape_params,
-                                  s["dx"] + v[0], s["dy"] + v[1], s["theta"] + v[2])
+                                  s["dx"] + v[0], s["dy"] + v[1], s["theta"] + v[2],
+                                  shape_fn=shape_fn)
 
         res = differential_evolution(
             obj_dxdytheta,
@@ -568,54 +672,59 @@ def fit_waveguide_to_contours(contour_pts, init_shape_params):
                         combined_area=res.fun)
 
     dx_f, dy_f, theta_f = best["dx"], best["dy"], best["theta"]
-    aligned_shape = transform_shape(generate_waveguide_shape(init_shape_params), dx_f, dy_f, theta_f)
+    aligned_shape = transform_shape(shape_fn(init_shape_params), dx_f, dy_f, theta_f)
 
     # Score = Hausdorff distance (worst-case boundary gap) between the two rings.
     hausdorff = Polygon(aligned_shape).hausdorff_distance(Polygon(contour_pts))
     return hausdorff, aligned_shape
 
 
-def _hausdorff_objective(shape_params, contour_pts):
+def _hausdorff_objective(shape_params, contour_pts, shape_fn=generate_waveguide_shape):
     """
     Picklable OUTER objective (module-level so it survives multiprocessing).
     Runs the full inner placement search and returns just the Hausdorff score.
     """
     try:
-        h, _ = fit_waveguide_to_contours(contour_pts, shape_params)
+        h, _ = fit_waveguide_to_contours(contour_pts, shape_params, shape_fn=shape_fn)
         return h
     except Exception:
         return 1e6   # penalize parameter vectors that blow up the geometry
 
 
 def optimize_shape_params(contour_pts, nominal_shape_params, workers=None,
-                          popsize=10, maxiter=50):
+                          popsize=10, maxiter=50,
+                          shape_fn=generate_waveguide_shape, bounds=None):
     """
-    STAGE 3a -- OUTER search over the 7 shape parameters.
+    STAGE 3a -- OUTER search over the shape parameters.
 
-    Differential evolution over:
-        W1..L2               : +/-20% of nominal
-        length_waveguide     : [100, max x-extent of the contour]
-    For each candidate it calls fit_waveguide_to_contours (the inner placement
-    search) and minimizes the resulting Hausdorff distance. Runs in parallel
-    across CPU cores.
+    Differential evolution over the shape parameters; for each candidate it
+    calls fit_waveguide_to_contours (the inner placement search) and minimizes
+    the resulting Hausdorff distance. Runs in parallel across CPU cores.
 
-    `nominal_shape_params` is the 7-vector in PARAM_NAMES order; the last entry
-    (length_waveguide) is only used to size defaults -- its bound comes from the
-    contour extent, not from the nominal value.
+    Parameters
+    ----------
+    nominal_shape_params : starting parameter vector.
+    shape_fn : which parametric model to fit. Default generate_waveguide_shape
+               (7 params in PARAM_NAMES order); pass generate_diamond_device
+               (6 params in DIAMOND_PARAM_NAMES order) for a diamond taper.
+    bounds   : explicit list of (lo, hi) per parameter. If None, the default
+               waveguide bounds are used: W1..L2 at +/-20% and length_waveguide
+               at [100, contour x-extent]. For non-default models you MUST pass
+               bounds (e.g. from diamond_bounds()).
 
-    Returns { 'best_shape_params': ndarray(7), 'best_hausdorff': float }.
+    Returns { 'best_shape_params': ndarray, 'best_hausdorff': float }.
     """
     contour_pts = np.asarray(contour_pts)
     if workers is None:
         workers = max(1, multiprocessing.cpu_count() - 1)
 
-    # length_waveguide upper bound = how wide the contour actually is.
-    max_length = np.max(contour_pts[:, 0]) - np.min(contour_pts[:, 0])
+    if bounds is None:
+        # Default = waveguide model: W1..L2 +/-20%, length_waveguide by extent.
+        max_length = np.max(contour_pts[:, 0]) - np.min(contour_pts[:, 0])
+        bounds = [(0.8 * p, 1.2 * p) for p in nominal_shape_params[:-1]]
+        bounds.append((100, max_length))
 
-    bounds = [(0.8 * p, 1.2 * p) for p in nominal_shape_params[:-1]]  # W1..L2 +/-20%
-    bounds.append((100, max_length))                                  # length_waveguide
-
-    obj = partial(_hausdorff_objective, contour_pts=contour_pts)
+    obj = partial(_hausdorff_objective, contour_pts=contour_pts, shape_fn=shape_fn)
     result = differential_evolution(
         obj, bounds, strategy='best1bin', popsize=popsize, maxiter=maxiter,
         tol=1e-3, polish=False, disp=True,

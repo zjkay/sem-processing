@@ -17,3 +17,4 @@ sem_pipeline_*.json
 
 # OS
 .DS_Store
+combined.gds

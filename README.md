@@ -54,7 +54,12 @@ python sem_pipeline.py data/SEM_results.tif --points "400,190;900,190" --design-
 
 - Default scale-bar ROIs are tuned for `SEM_results.tif`. For other magnifications pass new
   `text_box`/`scale_box` rectangles, or supply a known `nm_per_px` and skip Stage 1.
-- The built-in shape template (`generate_waveguide_shape`) is a straight waveguide + one-sided
-  taper. Swap it for your device geometry to fit other structures.
+- Two parametric models ship in `sem_pipeline.py`, selected via the `shape_fn` argument to
+  `fit_waveguide_to_contours` / `optimize_shape_params`:
+  - `generate_waveguide_shape` — straight waveguide + one-sided taper (`[W1..L2, length_waveguide]`).
+  - `generate_diamond_device` — symmetric diamond taper + guide (`[w_tip, w_max, w_guide, L_up, L_down, L_guide]`),
+    for devices that widen to a peak then narrow. Use `estimate_diamond_nominal(contour)` to auto-seed
+    params from the contour and `diamond_bounds(nominal)` for the search box.
+  Add your own generator (any `params -> (N,2) closed ring`) and pass it as `shape_fn` to fit other shapes.
 - The full outer optimization runs a placement search per candidate, so it takes minutes; the
   notebook demonstrates a fast single inner fit and gates the full search behind a flag.
