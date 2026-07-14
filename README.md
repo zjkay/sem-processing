@@ -6,14 +6,15 @@ Self-contained copy of the SEM analysis pipeline.
 
 | File | What it is |
 |------|------------|
-| `sem_pipeline.py` | The whole pipeline in one heavily-commented module (all 4 stages + orchestrator + CLI). |
+| `sem_pipeline.py` | The whole pipeline in one heavily-commented module (all 5 stages + orchestrator + CLI). |
 | `example.ipynb` | Worked example that runs each stage on a real SEM photo with visualizations. |
 | `data/SEM_results.tif` | Example SEM image (1024×768, 300 nm scale bar). |
 | `data/my_layout.gds` | Example existing design layout, for the Stage-4 spatial comparison. |
+| `data/distortion_X_raw.npy`, `data/distortion_Y.npy` | Example training data for Stage 5 — 27 measured devices' (x,y) positions and per-parameter fitted/nominal factors. |
 | `sam_vit_b_01ec64.pth` | Symlink to the SAM checkpoint (358 MB) in `../old/`. |
 | `requirements.txt` | Python dependencies. |
 
-## The 4 stages
+## The 5 stages
 
 1. **SEM → scale** — OCR the scale-bar label + measure its pixel length → `nm/px`.
 2. **SEM → cutout (SAM)** — Segment Anything turns click points into a mask → contour in nm.
@@ -21,6 +22,11 @@ Self-contained copy of the SEM analysis pipeline.
    and for each candidate find the best translation **and rotation/angle** for overlap (inner DE).
 4. **Compare vs existing** — spatially register the fitted outline onto an existing design
    GDS by maximizing overlap area; write a combined GDS.
+5. **Distortion prediction** — fab distortion (etch loading, proximity effects, dose
+   variation, ...) varies smoothly across a chip. Given many previously-measured devices'
+   `(x,y)` position + Stage-3 `fitted/nominal` ratio, fit a Gaussian Process
+   (`SpatialDistortionModel`) that predicts the expected distortion factor at a new `(x,y)`
+   — e.g. to pre-bias a design before fabricating it there.
 
 ## Setup
 
@@ -64,3 +70,7 @@ python sem_pipeline.py data/SEM_results.tif --points "400,190;900,190" --design-
   Add your own generator (any `params -> (N,2) closed ring`) and pass it as `shape_fn` to fit other shapes.
 - The full outer optimization runs a placement search per candidate, so it takes minutes; the
   notebook demonstrates a fast single inner fit and gates the full search behind a flag.
+- Stage 5 is a *separate question* from Stage 3: Stage 3 tells you how one device fabricated
+  relative to its own nominal params; Stage 5 predicts what distortion to *expect* at a
+  location you haven't measured yet, based on a scatter of previously-measured devices. Build
+  training rows with `compute_distortion_factors(nominal, fitted)` as you process more devices.

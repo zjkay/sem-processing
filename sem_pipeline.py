@@ -49,6 +49,23 @@ four stages the pipeline is built around:
                                    fabricated shape compares to what was drawn.
                                    -> from utils.superimpose_gds
 
+    STAGE 5  distortion prediction Fab distortion (etch loading, proximity
+                                   effects, dose variation, ...) tends to vary
+                                   smoothly across a chip/wafer. Given a set of
+                                   PREVIOUSLY measured devices at different
+                                   (x,y) positions -- each with its own Stage-3
+                                   fitted/nominal ratio per parameter -- fit a
+                                   Gaussian Process over position that predicts
+                                   the expected distortion factor at any NEW
+                                   (x,y), e.g. to pre-bias a design before
+                                   fabricating it there. This is a separate
+                                   question from Stage 3 (which only tells you
+                                   how one already-measured device fabricated
+                                   relative to its own nominal params).
+                                   -> new: SpatialDistortionModel,
+                                      compute_distortion_factors
+                                      (consolidated from old/distortion_inference/)
+
 HOW AN AGENT / SCRIPT SHOULD USE THIS
 -------------------------------------
 Everything is exposed as plain functions with no GUI dependency, plus one
@@ -82,6 +99,7 @@ DEPENDENCIES
     numpy, scipy, shapely, gdspy, opencv-python (cv2), pillow (PIL),
     pytesseract (+ system `tesseract` binary), matplotlib,
     torch + segment-anything (with a SAM checkpoint .pth on disk).
+    scikit-learn (only needed for Stage 5, SpatialDistortionModel).
 
 SAM checkpoint (default vit_b):
     wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
@@ -904,6 +922,156 @@ def superimpose_gds(gds_outline_filename, gds_design_filename, gds_output_filena
 
 
 # =============================================================================
+# STAGE 5 -- SPATIAL DISTORTION PREDICTION (fitted vs. nominal, across the chip)
+# =============================================================================
+# Stage 3 tells you how ONE device fabricated relative to its OWN nominal
+# params. This stage asks a different question: fab distortion (etch loading,
+# proximity effects, dose variation, ...) tends to vary smoothly with WHERE a
+# device sits on the chip/wafer. If you've measured (Stage 1-3) a scatter of
+# devices at different (x,y) positions, you can fit a spatial model of the
+# per-parameter distortion factor `fitted / nominal` and then PREDICT the
+# expected distortion at a new (x,y) -- e.g. to pre-bias a design before you
+# even fabricate it there, or to flag a die location as an outlier.
+#
+# distortion_factor[param] = fitted_param / nominal_param
+#   > 1  ->  that dimension printed LARGER than drawn at that location
+#   < 1  ->  that dimension printed SMALLER than drawn
+#
+# We model log(factor) with one Gaussian Process per parameter (factors are
+# multiplicative and strictly positive, so the log keeps the GP's Gaussian
+# noise assumption sane and keeps predictions positive after exponentiating).
+# =============================================================================
+
+def compute_distortion_factors(nominal_params: dict, fitted_params: dict) -> dict:
+    """
+    Per-parameter multiplicative distortion: fitted / nominal for every key
+    present in both dicts. This is the quantity the spatial model (below) is
+    trained to predict, and what you'd log alongside every Stage-3 fit result
+    if you want to build up training data for it over many devices/locations.
+    """
+    return {k: float(fitted_params[k]) / float(nominal_params[k])
+           for k in nominal_params if k in fitted_params and nominal_params[k] != 0}
+
+
+def _distortion_gp_kernel():
+    """
+    Composite GP kernel: an ARD Matern term (smooth spatial correlation, one
+    length scale per axis) plus a Rational Quadratic term (captures multiple
+    length scales at once, useful if distortion varies both locally -- e.g.
+    near a die edge -- and globally -- e.g. a wafer-scale gradient), plus a
+    White noise term to absorb measurement/fit noise. Bounds assume inputs
+    have been pre-normalized to roughly [-1, 1] (see SpatialDistortionModel).
+    """
+    from sklearn.gaussian_process.kernels import (
+        ConstantKernel as C, WhiteKernel, Matern, RationalQuadratic)
+    return (
+        C(1.0, (1e-2, 1e3)) *
+        (Matern(length_scale=[0.8, 0.8], length_scale_bounds=(0.25, 3.0), nu=1.5)
+         + RationalQuadratic(alpha=0.5, length_scale=1.2))
+    ) + WhiteKernel(noise_level=1e-4, noise_level_bounds=(1e-8, 1e-1))
+
+
+class SpatialDistortionModel:
+    """
+    Gaussian-Process model of per-parameter fab distortion as a function of
+    chip position. Fits on construction (small dataset -- tens of points --
+    so retraining is cheap).
+
+    Parameters
+    ----------
+    xy : (n,2) array of device positions (same physical units as your layout,
+         e.g. nm or um -- whatever `norm_divisor` is chosen in).
+    factors : (n,m) array of distortion_factor = fitted/nominal, one column
+              per parameter (build rows with compute_distortion_factors).
+    param_names : list[str] of length m, column order of `factors`.
+    norm_divisor : positions are divided by this before fitting, so the GP's
+                   length-scale priors (tuned for O(1) inputs) stay sensible.
+                   Pick roughly the half-width of your die/chip.
+
+    Example
+    -------
+        xy = np.array([[x1,y1], [x2,y2], ...])          # measured device positions
+        factors = np.array([[f_W1, f_W2, ...], ...])    # fitted/nominal per device
+        model = SpatialDistortionModel(xy, factors, PARAM_NAMES[:-1], norm_divisor=3000)
+        model.predict(x=1200, y=450)   # -> {'W1': 0.85, 'W2': 0.98, ...}
+    """
+
+    def __init__(self, xy, factors, param_names, norm_divisor=3000.0):
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.multioutput import MultiOutputRegressor
+        from sklearn.gaussian_process import GaussianProcessRegressor
+
+        self.param_names = list(param_names)
+        self.norm_divisor = float(norm_divisor)
+
+        xy = np.asarray(xy, dtype=float)
+        factors = np.asarray(factors, dtype=float)
+        x_div = xy / self.norm_divisor
+        self.scaler = StandardScaler().fit(x_div)
+        x_scaled = self.scaler.transform(x_div)
+        log_factors = np.log(factors)   # GP operates in log-space; see module docstring
+
+        base_gp = GaussianProcessRegressor(
+            kernel=_distortion_gp_kernel(), alpha=0.0, normalize_y=False,
+            n_restarts_optimizer=20, random_state=0)
+        # With only a handful of training points, sklearn routinely warns that
+        # the optimized kernel hyperparameters sit at a search bound -- benign
+        # here (the bounds are deliberately wide) and just clutters output.
+        import warnings
+        from sklearn.exceptions import ConvergenceWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', ConvergenceWarning)
+            self.model = MultiOutputRegressor(base_gp).fit(x_scaled, log_factors)
+
+    def _prep_xy(self, x, y):
+        xy_div = np.array([[x / self.norm_divisor, y / self.norm_divisor]])
+        return self.scaler.transform(xy_div)
+
+    def predict(self, x: float, y: float, return_std: bool = False) -> dict:
+        """
+        Predict distortion factors for every parameter at position (x, y).
+        With `return_std=True`, returns {'factors': {...}, 'std': {...}}
+        (std is in factor-space, via the lognormal variance formula);
+        otherwise returns just {param: factor}.
+        """
+        x_scaled = self._prep_xy(x, y)
+        factors, stds = {}, {}
+        for name, est in zip(self.param_names, self.model.estimators_):
+            if return_std:
+                mu_log, std_log = est.predict(x_scaled, return_std=True)
+                mu_log, std_log = float(mu_log.ravel()[0]), float(std_log)
+                mean_f = float(np.exp(mu_log))
+                if std_log > 0:
+                    var_f = (np.exp(std_log**2) - 1.0) * np.exp(2 * mu_log + std_log**2)
+                    stds[name] = float(np.sqrt(var_f))
+                else:
+                    stds[name] = 0.0
+                factors[name] = mean_f
+            else:
+                mu_log = float(est.predict(x_scaled).ravel()[0])
+                factors[name] = float(np.exp(mu_log))
+        return {'factors': factors, 'std': stds} if return_std else factors
+
+    def predict_grid(self, half_width=None, n=100):
+        """
+        Convenience for visualization: predict every parameter's distortion
+        factor over an n x n grid spanning +/-half_width (defaults to
+        norm_divisor) in both x and y. Returns (Xg, Yg, factors) where
+        factors has shape (n, n, len(param_names)).
+        """
+        half_width = half_width or self.norm_divisor
+        gx = np.linspace(-half_width, half_width, n)
+        gy = np.linspace(-half_width, half_width, n)
+        Xg, Yg = np.meshgrid(gx, gy)
+        factors = np.zeros((n, n, len(self.param_names)))
+        for i in range(n):
+            for j in range(n):
+                f = self.predict(Xg[i, j], Yg[i, j])
+                factors[i, j, :] = [f[p] for p in self.param_names]
+        return Xg, Yg, factors
+
+
+# =============================================================================
 # HELPERS -- save the fitted result as GDS + JSON
 # =============================================================================
 
@@ -961,9 +1129,12 @@ def run_full_pipeline(sem_path,
                       design_gds=None,
                       out_prefix=None,
                       outer_popsize=10,
-                      outer_maxiter=50):
+                      outer_maxiter=50,
+                      device_xy=None,
+                      distortion_model=None):
     """
-    Run the whole pipeline:  SEM -> scale -> SAM cutout -> fit -> (compare).
+    Run the whole pipeline:
+        SEM -> scale -> SAM cutout -> fit -> (compare) -> (distortion predict).
 
     Parameters
     ----------
@@ -977,9 +1148,18 @@ def run_full_pipeline(sem_path,
     design_gds     : reference layout to compare against (Stage 4). None -> skip.
     out_prefix     : path prefix for outputs ("<prefix>.gds", ".json",
                      "_combined.gds"). None -> "sem_pipeline_<timestamp>".
+    device_xy      : (x, y) chip position this device was measured at, in the
+                     same units as `distortion_model` was trained on. Required
+                     (with distortion_model) to run Stage 5.
+    distortion_model : a fitted SpatialDistortionModel (Stage 5). If given
+                     along with device_xy, predicts the expected distortion at
+                     this location and reports it next to the ACTUAL distortion
+                     this fit measured (fitted/nominal) -- a sanity check on
+                     both the fit and the spatial model.
 
     Returns a dict with contour, best params, Hausdorff, file paths, and
-    (if design_gds given) the spatial comparison result.
+    (if design_gds given) the spatial comparison result, and (if device_xy +
+    distortion_model given) predicted vs. actual distortion factors.
     """
     nominal_params = dict(nominal_params or DEFAULT_NOMINAL)
     if out_prefix is None:
@@ -988,21 +1168,21 @@ def run_full_pipeline(sem_path,
 
     # ---- STAGE 1: scale --------------------------------------------------
     if nm_per_px is None:
-        print("[1/4] Detecting scale...")
+        print("[1/5] Detecting scale...")
         scale_info = detect_scale_nm_per_px(sem_path, text_box, scale_box)
         nm_per_px = scale_info['nm_per_px']
     else:
-        print(f"[1/4] Using provided scale: {nm_per_px:.3f} nm/px")
+        print(f"[1/5] Using provided scale: {nm_per_px:.3f} nm/px")
         scale_info = {'nm_per_px': nm_per_px, 'length_nm': None,
                       'pixel_distance': None, 'raw_ocr': None}
 
     # ---- STAGE 2: SAM cutout --------------------------------------------
-    print("[2/4] Segmenting structure with SAM...")
+    print("[2/5] Segmenting structure with SAM...")
     contour_nm = sam_cutout(sem_path, nm_per_px, points=sam_points,
                             checkpoint=sam_checkpoint)
 
     # ---- STAGE 3: optimize fit ------------------------------------------
-    print("[3/4] Optimizing shape parameters + placement...")
+    print("[3/5] Optimizing shape parameters + placement...")
     length_wg = calculate_length_waveguide(contour_nm,
                                             nominal_params['L1'], nominal_params['L2'])
     nominal_vec = [nominal_params[n] for n in PARAM_NAMES[:-1]] + [length_wg]
@@ -1036,7 +1216,7 @@ def run_full_pipeline(sem_path,
 
     # ---- STAGE 4: compare against existing design -----------------------
     if design_gds is not None:
-        print("[4/4] Spatially comparing fit outline against existing design...")
+        print("[4/5] Spatially comparing fit outline against existing design...")
         combined_gds = f"{out_prefix}_combined.gds"
         # superimpose_gds reads layer-1 polygons from the outline file (our fit
         # GDS stores the measured contour on layer 1) and registers onto design.
@@ -1044,7 +1224,33 @@ def run_full_pipeline(sem_path,
         result['comparison'] = compare
         result['combined_gds'] = combined_gds
     else:
-        print("[4/4] No design_gds provided -- skipping spatial comparison.")
+        print("[4/5] No design_gds provided -- skipping spatial comparison.")
+
+    # ---- STAGE 5: spatial distortion prediction --------------------------
+    if device_xy is not None and distortion_model is not None:
+        print("[5/5] Predicting spatial distortion and comparing to this fit...")
+        x_dev, y_dev = device_xy
+        # complete_params includes length_waveguide, which the distortion
+        # model (typically trained on W1..L2 only) doesn't predict -- only
+        # score the parameters the model actually knows about.
+        predicted = distortion_model.predict(x_dev, y_dev)
+        actual = compute_distortion_factors(nominal_params, result['complete_params'])
+        actual = {k: v for k, v in actual.items() if k in predicted}
+        for name in predicted:
+            if name in actual:
+                print(f"      {name}: predicted x{predicted[name]:.3f}  "
+                     f"vs actual x{actual[name]:.3f}")
+        result['distortion'] = {'device_xy': [float(x_dev), float(y_dev)],
+                                'predicted_factors': predicted,
+                                'actual_factors': actual}
+        # Re-persist the JSON with the distortion comparison included.
+        with open(out_json) as f:
+            saved = json.load(f)
+        saved['distortion'] = result['distortion']
+        with open(out_json, 'w') as f:
+            json.dump(saved, f, indent=2)
+    else:
+        print("[5/5] No device_xy/distortion_model provided -- skipping distortion prediction.")
 
     print("Done.")
     return result
